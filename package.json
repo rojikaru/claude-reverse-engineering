@@ -12,5 +12,8 @@
   "dependencies": {
     "puppeteer": "^24.40.0",
     "zod": "^4.3.6"
+  },
+  "scripts": {
+    "start": "bun run index.ts"
   }
 }
