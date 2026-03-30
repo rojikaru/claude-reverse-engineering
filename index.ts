@@ -1,83 +1,53 @@
-import { type FileHandle, open as fopen } from "node:fs/promises";
+import {
+  type FileHandle,
+  open as fopen,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import assert from "node:assert";
-import { stdout } from "node:process";
+import process, { stdout } from "node:process";
 import { availableParallelism } from "node:os";
-import process from "node:process";
+import { setTimeout as setTimeoutP } from "node:timers/promises";
 
 import puppeteer from "puppeteer";
 import { adLibraryResponseSchema } from "./validator.js";
 
-const graphApiBaseUrl = "https://graph.facebook.com/v24.0/ads_archive";
-const snapshotBaseUrl = "https://www.facebook.com/ads/archive/render_ad";
+// --- Configuration & Constants ---
+const BATCH_SPLIT = 10;
+const GRAPH_API_BASE_URL = "https://graph.facebook.com/v24.0/ads_archive";
+const SNAPSHOT_BASE_URL = "https://www.facebook.com/ads/archive/render_ad";
 
-const access_token = process.env.ACCESS_TOKEN;
-assert.ok(access_token, "ACCESS_TOKEN must be set in environment variables");
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+assert.ok(ACCESS_TOKEN, "ACCESS_TOKEN must be set in environment variables");
 
+// --- Types ---
 interface CapturedRequest {
   headers: Record<string, string>;
   body: string;
 }
 
-let capturedGraphQLRequest: CapturedRequest | null = null;
+type BatchStatus = "unprocessed" | "in_progress" | "processed";
 
-const individualFetch = async (adID: string, writeStream: FileHandle) => {
-  if (!capturedGraphQLRequest) {
-    console.error("No GraphQL request captured");
-    process.exit(1);
+interface BatchState {
+  id: number;
+  pageIds: string[];
+  currentUrl: string | null;
+  status: BatchStatus;
+}
+
+interface GraphApiFetchResult {
+  ids: string[];
+  nextUrl: string | null;
+}
+
+// --- Utility Functions ---
+
+const chunkArray = <T>(arr: T[], size: number): T[][] => {
+  const result: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    result.push(arr.slice(i, i + size));
   }
-
-  // Swap out ID for current ad
-  const newVars = { adID };
-  const encodedNewVars = encodeURIComponent(JSON.stringify(newVars));
-
-  // Replace variables in the body
-  const modifiedBody = capturedGraphQLRequest.body.replace(
-    /variables=[^&]*/,
-    `variables=${encodedNewVars}`,
-  );
-
-  const modifiedReferer = capturedGraphQLRequest.headers["referer"]?.replace(
-    /id=\d+/,
-    `id=${adID}`,
-  );
-  const modifiedHeaders = {
-    ...capturedGraphQLRequest.headers,
-    referer: modifiedReferer,
-  };
-
-  try {
-    const response = await fetch("https://www.facebook.com/api/graphql/", {
-      method: "POST",
-      headers: modifiedHeaders,
-      body: modifiedBody,
-    });
-
-    const responseData = await response.json();
-    if (!responseData || responseData.errors) {
-      throw new Error(
-        `API error: ${responseData?.errors || "Unknown error"}`,
-      );
-    }
-
-    // Write to JSONL
-    await writeStream.write(
-      JSON.stringify({
-        ad_id: adID,
-        status: response.status,
-        data: responseData,
-        timestamp: new Date().toISOString(),
-      }) + "\n",
-    );
-  } catch (err) {
-    console.error(`Error fetching ad ${adID}:`, err);
-    await writeStream.write(
-      JSON.stringify({
-        ad_id: adID,
-        error: String(err),
-        timestamp: new Date().toISOString(),
-      }) + "\n",
-    );
-  }
+  return result;
 };
 
 const extractLimit = (url: string): number => {
@@ -92,255 +62,384 @@ const updateLimit = (url: string, newLimit: number): string => {
   return urlObj.toString();
 };
 
-const processBatch = async (
-  url: string,
-  writeStream: FileHandle,
-): Promise<string | null> => {
-  let currentUrl = url;
-  let currentLimit = extractLimit(url);
-  const minLimit = 10; // Don't go below 10 items per request
-  let lastError: { code: number; message: string } | null = null;
+const appendIdsToGraphApiJson = async (filePath: string, newIds: string[]) => {
+  let currentIds: string[] = [];
+  try {
+    const fileContent = await readFile(filePath, "utf8");
+    currentIds = JSON.parse(fileContent);
+  } catch {
+    // File likely doesn't exist yet, which is fine
+  }
 
-  while (currentLimit >= minLimit) {
-    const response = await fetch(currentUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
-      },
-    });
-    const data = await response.json();
+  currentIds.push(...newIds);
+  await writeFile(filePath, JSON.stringify(currentIds, null, 2));
+};
 
-    const usageHeader =
-      response.headers.get("x-business-use-case-usage") ?? "{}";
-    const usage = JSON.parse(usageHeader);
-    console.log(`API Response status: ${response.status}`);
-    console.log(`API Usage:`, JSON.stringify(usage, null, 2));
-
-    // Check for the specific error: "Please reduce the amount of data you're asking for"
-    if (!data || data.error?.code === 1) {
-      console.warn(
-        `⚠️  Hit data limit error. Reducing limit from ${currentLimit} to ${Math.floor(currentLimit / 2)}`,
-      );
-      lastError = data?.error;
-
-      // Halve the limit and retry
-      currentLimit = Math.floor(currentLimit / 2);
-      if (currentLimit < minLimit) {
-        console.error(
-          `✗ Could not process batch even at minimum limit (${minLimit})`,
-        );
-        console.error("API Error:", data?.error);
-        process.exit(1);
-      }
-
-      // Update URL with new limit
-      currentUrl = updateLimit(url, currentLimit);
-      continue;
-    }
-
-    // Handle other errors
-    if (data.error) {
-      console.error("API Error:", data?.error || "Unknown error");
-      process.exit(1);
-    }
-
-    console.log("API Response keys:", Object.keys(data));
-    console.log("API Response data type:", typeof data.data);
-    if (data.data) {
+// --- Step 1: Initialization ---
+const initializeBatches = async (
+  csvPath: string,
+  batchesPath: string,
+): Promise<BatchState[]> => {
+  let existingBatches: BatchState[] = [];
+  try {
+    const content = await readFile(batchesPath, "utf8");
+    existingBatches = JSON.parse(content);
+    if (existingBatches.length > 0) {
       console.log(
-        "API Response data sample:",
-        JSON.stringify(data.data).substring(0, 200),
+        `Loaded ${existingBatches.length} existing batches from ${batchesPath}`,
       );
+      return existingBatches;
     }
-
-    const parseResult = adLibraryResponseSchema.safeParse(data);
-
-    if (!parseResult.success) {
-      console.error("Validation error:", parseResult.error);
-      process.exit(1);
-    }
-
-    const ads = parseResult.data.data;
-
-    if (!ads || ads.length === 0) {
-      console.warn("No ads found");
-      return null;
-    }
-
-    console.log(
-      `✓ Successfully fetched ${ads.length} ads (with limit: ${currentLimit})`,
-    );
-
-    // Step 2: Open first ad in browser and intercept GraphQL request
-    const [firstAd] = ads;
-    assert.ok(firstAd?.id, "First ad should exist");
-    console.log(`\n=== Opening first ad (ID: ${firstAd.id}) ===`);
-
-    const snapshotParams = new URLSearchParams({
-      id: firstAd.id.toString(),
-      access_token,
-    });
-
-    const snapshotUrl = `${snapshotBaseUrl}?${snapshotParams.toString()}`;
-    console.log(`Snapshot URL: ${snapshotUrl}`);
-
-    const browser = await puppeteer.launch({ headless: true });
-    const page = await browser.newPage();
-
-    // Step 3: Listen for GraphQL requests
-    const requestPromise = new Promise<CapturedRequest>((resolve) => {
-      page.on("response", async (requestResponse) => {
-        const request = requestResponse.request();
-        const url = request.url();
-
-        if (url.includes("/graphql")) {
-          console.log(`\n=== Intercepted GraphQL request ===`);
-          console.log(`URL: ${url}`);
-
-          const headers = request.headers();
-          let body = (await request.fetchPostData()) || "";
-
-          // Filter out HTTP/2 pseudo-headers
-          const cleanedHeaders: Record<string, string> = {};
-          for (const [key, value] of Object.entries(headers)) {
-            if (!key.startsWith(":")) {
-              cleanedHeaders[key] = String(value);
-            }
-          }
-
-          console.log(`Headers:`, JSON.stringify(cleanedHeaders, null, 2));
-          console.log(`Body length: ${body.length} characters`);
-
-          // Extract variables from body
-          const variablesMatch = /variables=([^&]*)/.exec(body);
-          if (variablesMatch?.[1]) {
-            try {
-              const decodedVars = decodeURIComponent(variablesMatch[1]);
-              console.log(`Variables: ${decodedVars}`);
-            } catch {
-              console.log(`Could not decode variables`);
-            }
-          }
-
-          capturedGraphQLRequest = { headers: cleanedHeaders, body };
-          resolve({ headers: cleanedHeaders, body });
-        }
-      });
-    });
-
-    // Open the page
-    await page.goto(snapshotUrl, { waitUntil: "networkidle2", timeout: 30000 });
-
-    // Wait for the request with a timeout
-    await Promise.race([
-      requestPromise,
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error("GraphQL request not captured")),
-          10000,
-        ),
-      ),
-    ]).catch((err) => console.error("Warning:", err.message));
-
-    await browser.close();
-
-    if (!capturedGraphQLRequest) {
-      console.error("Failed to capture GraphQL request");
-      process.exit(1);
-    }
-
-    // Step 4: Process all ads and save to JSONL
-    console.log(`\n=== Processing all ads ===`);
-
-    // Extract the variables from the original body
-    const adIDMatch = /variables=([^&]*)/.exec(capturedGraphQLRequest.body);
-    if (!adIDMatch?.[1]) {
-      console.error("Could not extract variables from body");
-      process.exit(1);
-    }
-
-    const encodedVars = adIDMatch[1];
-    let decodedVars: { adID: string };
-    try {
-      decodedVars = JSON.parse(decodeURIComponent(encodedVars));
-    } catch (e) {
-      console.error("Could not parse variables:", e);
-      process.exit(1);
-    }
-
-    console.log(`Original variables:`, decodedVars);
-
-    const sliceSize = availableParallelism();
-    for (let i = 0; i < ads.length; i += sliceSize) {
-      const slice = ads.slice(i, i + sliceSize);
-      await Promise.all(
-        slice.map((ad) => individualFetch(ad.id.toString(), writeStream)),
-      );
-      stdout.write(`\rProcessed ${i}/${ads.length} ads`);
-    }
-    console.log(`\nAll ads processed`);
-
-    // Successfully processed, return next pagination URL
-    return data.paging?.next || null;
+  } catch {
+    console.log("No existing batches found, creating new ones from CSV.");
   }
 
-  // If we exit the loop without returning, we've hit the minimum limit
-  if (lastError) {
-    console.error(
-      `✗ Failed to process batch even at minimum limit (${minLimit}): ${lastError.message}`,
-    );
-  }
-  return null;
-};
-
-const chunkArray = <T>(arr: T[], size: number) => {
-  const result = [];
-  for (let i = 0; i < arr.length; i += size) {
-    result.push(arr.slice(i, i + size));
-  }
-  return result;
-};
-
-if (import.meta.main) {
-  const outputFile = "ads.jsonl";
-  const writeStream = await fopen(outputFile, "w");
-
-  const csv = "./page_ids.csv";
-  const csvContent = await Bun.file(csv).text();
+  const csvContent = await readFile(csvPath, "utf8");
   const targetAccounts = csvContent
     .split("\n")
     .slice(1) // Skip header
     .map((line) => line.trim())
     .filter(Boolean);
 
-  let totalAds = 0;
-
-  // Step 1: Fetch ads from Graph API
-  for (const targetAccountsChunk of chunkArray(targetAccounts, 10)) {
-    const graphApiParams = new URLSearchParams({
+  const chunks = chunkArray(targetAccounts, BATCH_SPLIT);
+  const batches: BatchState[] = chunks.map((chunk, index) => {
+    const params = new URLSearchParams({
       ad_type: "ALL",
       ad_active_status: "ALL",
-      // search_page_ids: "164271473587410",
-      search_page_ids: targetAccountsChunk.join(","),
+      search_page_ids: chunk.join(","),
       ad_reached_countries: "['']",
       limit: "2000",
-      // fields: "total_reach_by_location,target_locations,currency,ad_creation_time,ad_creative_bodies,impressions,spend,page_id,ad_snapshot_url,ad_delivery_start_time,ad_delivery_stop_time",
       fields: "id",
-      access_token,
+      access_token: ACCESS_TOKEN,
     });
 
-    let url: string | null | undefined =
-      `${graphApiBaseUrl}?${graphApiParams.toString()}`;
+    return {
+      id: index + 1,
+      pageIds: chunk,
+      currentUrl: `${GRAPH_API_BASE_URL}?${params.toString()}`,
+      status: "unprocessed",
+    };
+  });
 
-    while (url) {
-      console.log(`Fetching: ${url}`);
-      url = await processBatch(url, writeStream);
+  await writeFile(batchesPath, JSON.stringify(batches, null, 2));
+  return batches;
+};
+
+// --- Step 2: Graph API Collection ---
+
+const fetchGraphApiWithRetry = async (
+  url: string,
+  showUsageHeader: boolean = false,
+): Promise<GraphApiFetchResult | null> => {
+  let currentUrl = url;
+  let currentLimit = extractLimit(url);
+  const minLimit = 10;
+
+  while (currentLimit >= minLimit) {
+    console.log(`Fetching Graph API: ${currentUrl}`);
+    const response = await fetch(currentUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+      },
+    });
+
+    const data = await response.json();
+    if (showUsageHeader) {
+      const usageHeader =
+      response.headers.get("x-business-use-case-usage") ?? "{}";
+      const usage = JSON.parse(usageHeader);
+      console.log(`API Usage:`, JSON.stringify(usage, null, 2));
     }
 
-    totalAds += targetAccountsChunk.length;
-    console.log(`\nTotal accounts processed: ${totalAds}`);
+    // Handle Data Limit Error (Code 1)
+    if (!data || data.error?.code === 1) {
+      console.warn(
+        `⚠️ Hit data limit error. Reducing limit from ${currentLimit} to ${Math.floor(currentLimit / 2)}`,
+      );
+      currentLimit = Math.floor(currentLimit / 2);
+
+      if (currentLimit < minLimit) {
+        console.error(
+          `✗ Could not process batch even at minimum limit (${minLimit})`,
+        );
+        return null;
+      }
+
+      currentUrl = updateLimit(url, currentLimit);
+      continue;
+    }
+
+    if (data.error) {
+      console.error("API Error:", data.error);
+      return null;
+    }
+
+    // Validation
+    const parseResult = adLibraryResponseSchema.safeParse(data);
+    if (!parseResult.success) {
+      console.error("Validation error:", parseResult.error);
+      return null;
+    }
+
+    const ads = parseResult.data.data;
+    if (!ads || ads.length === 0) {
+      return { ids: [], nextUrl: data.paging?.next || null };
+    }
+
+    const ids = ads.map((ad: any) => ad.id.toString());
+    console.log(`✓ Fetched ${ids.length} IDs.`);
+
+    return {
+      ids,
+      nextUrl: data.paging?.next || null,
+    };
+  }
+
+  return null;
+};
+
+const collectAllAdIds = async (batchesPath: string, graphApiPath: string) => {
+  const fileContent = await readFile(batchesPath, "utf8");
+  const batches: BatchState[] = JSON.parse(fileContent);
+
+  for (const batch of batches) {
+    if (batch.status === "processed") {
+      continue;
+    }
+
+    console.log(`\n=== Processing Batch ${batch.id} ===`);
+    batch.status = "in_progress";
+    await writeFile(batchesPath, JSON.stringify(batches, null, 2));
+
+    while (batch.currentUrl) {
+      const result = await fetchGraphApiWithRetry(batch.currentUrl, true);
+      if (!result) {
+        console.error(
+          `Failed to fetch cursor for batch ${batch.id}. Halting batch progress.`,
+        );
+        break;
+      }
+
+      if (result.ids.length > 0) {
+        await appendIdsToGraphApiJson(graphApiPath, result.ids);
+      }
+
+      if (result.nextUrl) {
+        batch.currentUrl = result.nextUrl;
+        await writeFile(batchesPath, JSON.stringify(batches, null, 2));
+      } else {
+        batch.currentUrl = null;
+        batch.status = "processed";
+        await writeFile(batchesPath, JSON.stringify(batches, null, 2));
+        console.log(`✓ Batch ${batch.id} exhausted completely.`);
+        break;
+      }
+    }
+  }
+};
+
+// --- Step 3: Puppeteer Capture ---
+
+const captureGraphQLRequest = async (
+  firstAdId: string,
+): Promise<CapturedRequest | null> => {
+  console.log(
+    `\n=== Spinning up Puppeteer for template extraction (Ad ID: ${firstAdId}) ===`,
+  );
+  const snapshotParams = new URLSearchParams({
+    id: firstAdId,
+    access_token: ACCESS_TOKEN,
+  });
+
+  const snapshotUrl = `${SNAPSHOT_BASE_URL}?${snapshotParams.toString()}`;
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+  let capturedGraphQLRequest: CapturedRequest | null = null;
+
+  const requestPromise = new Promise<CapturedRequest>((resolve) => {
+    page.on("response", async (requestResponse) => {
+      const request = requestResponse.request();
+      const url = request.url();
+
+      if (url.includes("/graphql")) {
+        const headers = request.headers();
+        const body = (await request.fetchPostData()) || "";
+
+        const cleanedHeaders: Record<string, string> = {};
+        for (const [key, value] of Object.entries(headers)) {
+          if (!key.startsWith(":")) {
+            cleanedHeaders[key] = String(value);
+          }
+        }
+
+        resolve({ headers: cleanedHeaders, body });
+      }
+    });
+  });
+
+  try {
+    await page.goto(snapshotUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    capturedGraphQLRequest = await Promise.race([
+      requestPromise,
+      new Promise<CapturedRequest>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("GraphQL request not captured in time")),
+          15000,
+        ),
+      ),
+    ]);
+    console.log(`✓ Intercepted GraphQL successfully.`);
+  } catch (err) {
+    console.error("Failed to capture GraphQL request:", err);
+  } finally {
+    await browser.close();
+  }
+
+  return capturedGraphQLRequest;
+};
+
+// --- Step 4: Individual Fetching & Processing ---
+
+const individualFetch = async (
+  adID: string,
+  writeStream: FileHandle,
+  capturedGraphQLRequest: CapturedRequest,
+) => {
+  const newVars = { adID };
+  const encodedNewVars = encodeURIComponent(JSON.stringify(newVars));
+
+  const modifiedBody = capturedGraphQLRequest.body.replace(
+    /variables=[^&]*/,
+    `variables=${encodedNewVars}`,
+  );
+
+  const modifiedReferer = capturedGraphQLRequest.headers["referer"]?.replace(
+    /id=\d+/,
+    `id=${adID}`,
+  );
+
+  const modifiedHeaders = {
+    ...capturedGraphQLRequest.headers,
+    referer: modifiedReferer,
+  };
+
+  try {
+    const response = await fetch("https://www.facebook.com/api/graphql/", {
+      method: "POST",
+      headers: modifiedHeaders,
+      body: modifiedBody,
+    });
+
+    const responseData = await response.json();
+    if (!responseData || responseData.errors) {
+      throw new Error(`API error: ${responseData?.errors || "Unknown error"}`);
+    }
+
+    const data =
+      responseData.data?.ad_library_main?.demo_ad_archive_result
+        ?.demo_ad_archive;
+    if (!data) {
+      throw new Error("Missing expected data in response");
+    }
+
+    await writeStream.write(
+      JSON.stringify({
+        ad_id: adID,
+        status: response.status,
+        data,
+        timestamp: new Date().toISOString(),
+      }) + "\n",
+    );
+  } catch (err) {
+    await writeStream.write(
+      JSON.stringify({
+        ad_id: adID,
+        error: String(err),
+        timestamp: new Date().toISOString(),
+      }) + "\n",
+    );
+  }
+};
+
+const processAdsFromGraphApi = async (
+  graphApiPath: string,
+  outputPath: string,
+  browserSliceSize: number = 100,
+  networkSliceSize: number = availableParallelism(),
+) => {
+  let allIds: string[] = [];
+  try {
+    allIds = JSON.parse(await readFile(graphApiPath, "utf8"));
+  } catch {
+    console.error(
+      `Could not read ${graphApiPath}. Have you run the collector step?`,
+    );
+    return;
+  }
+
+  if (allIds.length === 0) {
+    console.log("No IDs to process.");
+    return;
+  }
+
+  const writeStream = await fopen(outputPath, "a");
+
+  const idChunks = chunkArray(allIds, browserSliceSize);
+  console.log(
+    `\n=== Processing ${allIds.length} total ads in chunks of ${browserSliceSize} ===`,
+  );
+
+  for (const [i, chunk] of idChunks.entries()) {
+    console.log(`\nProcessing main chunk ${i + 1}/${idChunks.length}`);
+
+    // Grab template using the first ID of this specific chunk
+    const firstId = chunk[0];
+    const capturedReq = await captureGraphQLRequest(firstId);
+
+    if (!capturedReq) {
+      console.error(`Skipping chunk ${i + 1} due to missing GraphQL template.`);
+      continue;
+    }
+
+    for (let j = 0; j < chunk.length; j += networkSliceSize) {
+      const slice = chunk.slice(j, j + networkSliceSize);
+      await Promise.all(
+        slice.map((adId) => individualFetch(adId, writeStream, capturedReq)),
+      );
+
+      stdout.write(
+        `\rProcessed ${Math.min(j + networkSliceSize, chunk.length)}/${chunk.length} ads in current chunk`,
+      );
+      await setTimeoutP(1000 + Math.random() * 1000);
+    }
+    console.log();
   }
 
   await writeStream.close();
-  console.log(`\nResults saved to ${outputFile}`);
+  console.log(`\n✓ All ads processed and saved to ${outputPath}`);
+};
+
+const main = async () => {
+  const CSV_FILE = "./page_ids.csv";
+  const BATCHES_JSON = "./batches.json";
+  const GRAPH_API_JSON = "./graph-api.json";
+  const ADS_JSONL = "./ads.jsonl";
+
+  // Step 1: Initialize batches tracking file
+  await initializeBatches(CSV_FILE, BATCHES_JSON);
+
+  // Step 2: Traverse Graph API & harvest purely string IDs into graph-api.json
+  await collectAllAdIds(BATCHES_JSON, GRAPH_API_JSON);
+
+  // Step 3 & 4: Process the harvested IDs using Puppeteer logic
+  await processAdsFromGraphApi(GRAPH_API_JSON, ADS_JSONL);
+};
+
+if (import.meta.main) {
+  await main().catch((error) => {
+    console.error("Unexpected error in main execution:", error);
+    process.exit(1);
+  });
 }
