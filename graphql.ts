@@ -150,8 +150,7 @@ const fetchAdData = async (
   const data =
     payload.data?.ad_library_main?.demo_ad_archive_result?.demo_ad_archive;
   if (!data) {
-    console.error("Missing expected data in response");
-    process.exit(1);
+    throw new SessionRefreshRequiredError("Missing expected data in response");
   }
 
   await writeResult(writeStream, {
