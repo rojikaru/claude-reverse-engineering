@@ -10,7 +10,9 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "p-limit": "^6.2.0",
     "puppeteer": "^24.40.0",
+    "undici": "^6.21.0",
     "zod": "^4.3.6"
   },
   "scripts": {
