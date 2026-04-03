@@ -380,9 +380,6 @@ const processPageState = async (
     ? getLimitFromUrl(pageState.currentUrl)
     : 4000;
   while (pageState.currentUrl) {
-    // Random delay between 1-3 seconds
-    await setTimeout(1000 + Math.random() * 2000);
-
     const { result, currentLimit, haltRemainingPages } =
       await fetchGraphApiPage({
         url: pageState.currentUrl,
@@ -419,9 +416,17 @@ const processPageState = async (
       pageIdsFetched += result.ids.length;
     }
 
-    pageState.currentUrl = result.nextUrl
-      ? updateLimitInUrl(result.nextUrl, pageLimit)
-      : null;
+    if (result.ids.length < pageLimit) {
+      console.log(
+        `Fetched ${result.ids.length} IDs, which is less than the current limit of ${pageLimit}. Assuming we've reached the end of available data for this page.`,
+      );
+      pageState.currentUrl = null;
+    } else if (result.nextUrl) {
+      pageState.currentUrl = updateLimitInUrl(result.nextUrl, pageLimit);
+    } else {
+      pageState.currentUrl = null;
+    }
+
     await writeJsonArray(pageStatesPath, pageStates);
   }
 
