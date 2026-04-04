@@ -13,10 +13,10 @@ import type { CapturedRequest } from "./types.js";
 // 1. Tame the Agent. Mimic a browser's short-lived keep-alive.
 const CONCURRENCY = 20;
 const keepAliveAgent = new Agent({
-  keepAliveTimeout: 4000,       // 4 seconds
-  keepAliveMaxTimeout: 10000,   // 10 seconds max life
-  connections: CONCURRENCY,     // Match concurrency exactly
-  pipelining: 1                 // Disable heavy pipelining
+  keepAliveTimeout: 4000, // 4 seconds
+  keepAliveMaxTimeout: 10000, // 10 seconds max life
+  connections: CONCURRENCY, // Match concurrency exactly
+  pipelining: 1, // Disable heavy pipelining
 });
 
 class SessionRefreshRequiredError extends Error {}
@@ -201,7 +201,7 @@ const processSingleAd = async (
 
 export const processAdsFromGraphApi = async (
   graphApiPath: string,
-  outputPath: string
+  outputPath: string,
 ) => {
   const allIds = await readJsonlRecords<string>(graphApiPath);
   if (allIds.length === 0) {
@@ -211,7 +211,7 @@ export const processAdsFromGraphApi = async (
 
   const writeStream = await fopen(outputPath, "a");
   const templateSession = new GraphQLTemplateSession();
-  
+
   // 2. Initialize p-limit cleanly
   const limit = pLimit(CONCURRENCY);
   let processedCount = 0;
@@ -226,7 +226,9 @@ export const processAdsFromGraphApi = async (
       return;
     }
 
-    console.log(`\n=== Processing ${allIds.length} ads (Concurrency: ${CONCURRENCY}) ===`);
+    console.log(
+      `\n=== Processing ${allIds.length} ads (Concurrency: ${CONCURRENCY}) ===`,
+    );
 
     for (const adId of allIds) {
       // 3. Memory backpressure: pause synchronous loop if queue gets too large
@@ -236,10 +238,10 @@ export const processAdsFromGraphApi = async (
 
       limit(async () => {
         await processSingleAd(adId, writeStream, templateSession);
-        
+
         // 4. Micro-delay INSIDE the limit ensures paced throughput, preventing burst throttling
-        await setTimeoutP(100 + Math.random() * 200); 
-        
+        await setTimeoutP(100 + Math.random() * 200);
+
         processedCount++;
         // Write standard output synchronously to avoid Promise.resolver hangs
         stdout.write(`\rProcessed ${processedCount}/${allIds.length} ads`);
