@@ -8,7 +8,7 @@ import assert from "node:assert";
 import process, { stdout } from "node:process";
 import { setTimeout as setTimeoutP } from "node:timers/promises";
 
-import puppeteer from "puppeteer";
+import { type Browser, launch } from "puppeteer";
 import { adLibraryResponseSchema } from "./validator.js";
 
 // --- Configuration & Constants ---
@@ -146,7 +146,7 @@ const fetchGraphApiWithRetry = async (
     const data = await response.json();
     if (showUsageHeader) {
       const usageHeader =
-      response.headers.get("x-business-use-case-usage") ?? "{}";
+        response.headers.get("x-business-use-case-usage") ?? "{}";
       const usage = JSON.parse(usageHeader);
       console.log(`API Usage:`, JSON.stringify(usage, null, 2));
     }
@@ -239,12 +239,12 @@ const collectAllAdIds = async (batchesPath: string, graphApiPath: string) => {
 };
 
 // --- Step 3: Puppeteer Capture ---
-
 const captureGraphQLRequest = async (
   firstAdId: string,
+  browser: Browser,
 ): Promise<CapturedRequest | null> => {
   console.log(
-    `\n=== Spinning up Puppeteer for template extraction (Ad ID: ${firstAdId}) ===`,
+    `\n=== Spinning up new page for template extraction (Ad ID: ${firstAdId}) ===`,
   );
   const snapshotParams = new URLSearchParams({
     id: firstAdId,
@@ -253,7 +253,6 @@ const captureGraphQLRequest = async (
 
   const snapshotUrl = `${SNAPSHOT_BASE_URL}?${snapshotParams.toString()}`;
 
-  const browser = await puppeteer.launch({ headless: true });
   const page = await browser.newPage();
   let capturedGraphQLRequest: CapturedRequest | null = null;
 
@@ -293,11 +292,18 @@ const captureGraphQLRequest = async (
   } catch (err) {
     console.error("Failed to capture GraphQL request:", err);
   } finally {
-    await browser.close();
+    await page.close();
   }
 
   return capturedGraphQLRequest;
 };
+
+class TemplateExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TemplateExpiredError";
+  }
+}
 
 // --- Step 4: Individual Fetching & Processing ---
 
@@ -331,16 +337,22 @@ const individualFetch = async (
       body: modifiedBody,
     });
 
+    if (response.status === 401 || response.status === 403) {
+      throw new TemplateExpiredError(`Status ${response.status}`);
+    }
+
     const responseData = await response.json();
     if (!responseData || responseData.errors) {
-      throw new Error(`API error: ${responseData?.errors || "Unknown error"}`);
+      throw new TemplateExpiredError(
+        `API error: ${responseData?.errors || "Unknown error"}`,
+      );
     }
 
     const data =
       responseData.data?.ad_library_main?.demo_ad_archive_result
         ?.demo_ad_archive;
     if (!data) {
-      throw new Error("Missing expected data in response");
+      throw new TemplateExpiredError("Missing expected data in response");
     }
 
     await writeStream.write(
@@ -352,6 +364,9 @@ const individualFetch = async (
       }) + "\n",
     );
   } catch (err) {
+    if (err instanceof TemplateExpiredError) {
+      throw err; // bubble up to trigger template refresh
+    }
     await writeStream.write(
       JSON.stringify({
         ad_id: adID,
@@ -365,7 +380,7 @@ const individualFetch = async (
 const processAdsFromGraphApi = async (
   graphApiPath: string,
   outputPath: string,
-  browserSliceSize: number = 100,
+  browser: Browser,
   networkSliceSize: number = 20,
 ) => {
   let allIds: string[] = [];
@@ -385,37 +400,53 @@ const processAdsFromGraphApi = async (
 
   const writeStream = await fopen(outputPath, "a");
 
-  const idChunks = chunkArray(allIds, browserSliceSize);
-  console.log(
-    `\n=== Processing ${allIds.length} total ads in chunks of ${browserSliceSize} ===`,
-  );
+  console.log(`\n=== Processing ${allIds.length} total ads ===`);
 
-  for (const [i, chunk] of idChunks.entries()) {
-    console.log(`\nProcessing main chunk ${i + 1}/${idChunks.length}`);
+  let currentTemplate: CapturedRequest | null = null;
+  let currentIndex = 0;
 
-    // Grab template using the first ID of this specific chunk
-    const firstId = chunk[0];
-    const capturedReq = await captureGraphQLRequest(firstId);
-
-    if (!capturedReq) {
-      console.error(`Skipping chunk ${i + 1} due to missing GraphQL template.`);
-      continue;
+  while (currentIndex < allIds.length) {
+    if (!currentTemplate) {
+      currentTemplate = await captureGraphQLRequest(
+        allIds[currentIndex],
+        browser,
+      );
+      if (!currentTemplate) {
+        console.error(
+          `Failed to get GraphQL template for Ad ID ${allIds[currentIndex]}. Skipping one Ad ID.`,
+        );
+        currentIndex++;
+        continue;
+      }
     }
 
-    for (let j = 0; j < chunk.length; j += networkSliceSize) {
-      const slice = chunk.slice(j, j + networkSliceSize);
+    const slice = allIds.slice(currentIndex, currentIndex + networkSliceSize);
+
+    try {
       await Promise.all(
-        slice.map((adId) => individualFetch(adId, writeStream, capturedReq)),
+        slice.map((adId) =>
+          individualFetch(adId, writeStream, currentTemplate!),
+        ),
       );
 
-      stdout.write(
-        `\rProcessed ${Math.min(j + networkSliceSize, chunk.length)}/${chunk.length} ads in current chunk`,
-      );
+      currentIndex += slice.length;
+      stdout.write(`\rProcessed ${currentIndex}/${allIds.length} ads`);
       await setTimeoutP(1000 + Math.random() * 1000);
+    } catch (err) {
+      if (err instanceof TemplateExpiredError) {
+        console.log(
+          `\nTemplate expired (${err.message}). refreshing template.`,
+        );
+        currentTemplate = null; // will be refreshed in next loop iteration
+      } else {
+        console.error("Unexpected error processing slice:", err);
+        // We shouldn't hit this since individualFetch catches non-expired errors, but just in case
+        currentIndex += slice.length;
+      }
     }
-    console.log();
   }
 
+  console.log();
   await writeStream.close();
   console.log(`\n✓ All ads processed and saved to ${outputPath}`);
 };
@@ -433,7 +464,12 @@ const main = async () => {
   await collectAllAdIds(BATCHES_JSON, GRAPH_API_JSON);
 
   // Step 3 & 4: Process the harvested IDs using Puppeteer logic
-  await processAdsFromGraphApi(GRAPH_API_JSON, ADS_JSONL);
+  const browser = await launch({ headless: true });
+  try {
+    await processAdsFromGraphApi(GRAPH_API_JSON, ADS_JSONL, browser);
+  } finally {
+    await browser.close();
+  }
 };
 
 if (import.meta.main) {
