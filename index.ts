@@ -3,6 +3,7 @@ import {
   open as fopen,
   readFile,
   writeFile,
+  appendFile,
 } from "node:fs/promises";
 import assert from "node:assert";
 import process, { stdout } from "node:process";
@@ -12,7 +13,6 @@ import { type Browser, launch } from "puppeteer";
 import { adLibraryResponseSchema } from "./validator.js";
 
 // --- Configuration & Constants ---
-const BATCH_SPLIT = 10;
 const GRAPH_API_BASE_URL = "https://graph.facebook.com/v24.0/ads_archive";
 const SNAPSHOT_BASE_URL = "https://www.facebook.com/ads/archive/render_ad";
 
@@ -25,13 +25,12 @@ interface CapturedRequest {
   body: string;
 }
 
-type BatchStatus = "unprocessed" | "in_progress" | "processed";
+type PageStatus = "unprocessed" | "in_progress" | "processed";
 
-interface BatchState {
-  id: number;
-  pageIds: string[];
+interface PageState {
+  pageId: string;
   currentUrl: string | null;
-  status: BatchStatus;
+  status: PageStatus;
 }
 
 interface GraphApiFetchResult {
@@ -40,14 +39,6 @@ interface GraphApiFetchResult {
 }
 
 // --- Utility Functions ---
-
-const chunkArray = <T>(arr: T[], size: number): T[][] => {
-  const result: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) {
-    result.push(arr.slice(i, i + size));
-  }
-  return result;
-};
 
 const extractLimit = (url: string): number => {
   const urlObj = new URL(url);
@@ -61,36 +52,29 @@ const updateLimit = (url: string, newLimit: number): string => {
   return urlObj.toString();
 };
 
-const appendIdsToGraphApiJson = async (filePath: string, newIds: string[]) => {
-  let currentIds: string[] = [];
-  try {
-    const fileContent = await readFile(filePath, "utf8");
-    currentIds = JSON.parse(fileContent);
-  } catch {
-    // File likely doesn't exist yet, which is fine
-  }
-
-  currentIds.push(...newIds);
-  await writeFile(filePath, JSON.stringify(currentIds, null, 2));
+const appendIdsToGraphApiJsonl = async (filePath: string, newIds: string[]) => {
+  if (newIds.length === 0) return;
+  const content = newIds.map((id) => JSON.stringify({ id })).join("\n") + "\n";
+  await appendFile(filePath, content, "utf8");
 };
 
 // --- Step 1: Initialization ---
-const initializeBatches = async (
+const initializePages = async (
   csvPath: string,
-  batchesPath: string,
-): Promise<BatchState[]> => {
-  let existingBatches: BatchState[] = [];
+  pagesPath: string,
+): Promise<PageState[]> => {
+  let existingPages: PageState[] = [];
   try {
-    const content = await readFile(batchesPath, "utf8");
-    existingBatches = JSON.parse(content);
-    if (existingBatches.length > 0) {
+    const content = await readFile(pagesPath, "utf8");
+    existingPages = JSON.parse(content);
+    if (existingPages.length > 0) {
       console.log(
-        `Loaded ${existingBatches.length} existing batches from ${batchesPath}`,
+        `Loaded ${existingPages.length} existing pages from ${pagesPath}`,
       );
-      return existingBatches;
+      return existingPages;
     }
   } catch {
-    console.log("No existing batches found, creating new ones from CSV.");
+    console.log("No existing pages found, creating new ones from CSV.");
   }
 
   const csvContent = await readFile(csvPath, "utf8");
@@ -100,12 +84,11 @@ const initializeBatches = async (
     .map((line) => line.trim())
     .filter(Boolean);
 
-  const chunks = chunkArray(targetAccounts, BATCH_SPLIT);
-  const batches: BatchState[] = chunks.map((chunk, index) => {
+  const pages: PageState[] = targetAccounts.map((pageId) => {
     const params = new URLSearchParams({
       ad_type: "ALL",
       ad_active_status: "ALL",
-      search_page_ids: chunk.join(","),
+      search_page_ids: pageId,
       ad_reached_countries: "['']",
       limit: "2000",
       fields: "id",
@@ -113,15 +96,14 @@ const initializeBatches = async (
     });
 
     return {
-      id: index + 1,
-      pageIds: chunk,
+      pageId,
       currentUrl: `${GRAPH_API_BASE_URL}?${params.toString()}`,
       status: "unprocessed",
     };
   });
 
-  await writeFile(batchesPath, JSON.stringify(batches, null, 2));
-  return batches;
+  await writeFile(pagesPath, JSON.stringify(pages, null, 2));
+  return pages;
 };
 
 // --- Step 2: Graph API Collection ---
@@ -129,10 +111,10 @@ const initializeBatches = async (
 const fetchGraphApiWithRetry = async (
   url: string,
   showUsageHeader: boolean = false,
+  minLimit: number = 10,
 ): Promise<GraphApiFetchResult | null> => {
   let currentUrl = url;
   let currentLimit = extractLimit(url);
-  const minLimit = 10;
 
   while (currentLimit >= minLimit) {
     console.log(`Fetching Graph API: ${currentUrl}`);
@@ -183,7 +165,7 @@ const fetchGraphApiWithRetry = async (
 
     const ads = parseResult.data.data;
     if (!ads || ads.length === 0) {
-      return { ids: [], nextUrl: data.paging?.next || null };
+      return { ids: [], nextUrl: null };
     }
 
     const ids = ads.map((ad: any) => ad.id.toString());
@@ -191,47 +173,47 @@ const fetchGraphApiWithRetry = async (
 
     return {
       ids,
-      nextUrl: data.paging?.next || null,
+      nextUrl: ids.length < currentLimit ? null : data.paging?.next || null,
     };
   }
 
   return null;
 };
 
-const collectAllAdIds = async (batchesPath: string, graphApiPath: string) => {
-  const fileContent = await readFile(batchesPath, "utf8");
-  const batches: BatchState[] = JSON.parse(fileContent);
+const collectAllAdIds = async (pagesPath: string, graphApiPath: string) => {
+  const fileContent = await readFile(pagesPath, "utf8");
+  const pages: PageState[] = JSON.parse(fileContent);
 
-  for (const batch of batches) {
-    if (batch.status === "processed") {
+  for (const page of pages) {
+    if (page.status === "processed") {
       continue;
     }
 
-    console.log(`\n=== Processing Batch ${batch.id} ===`);
-    batch.status = "in_progress";
-    await writeFile(batchesPath, JSON.stringify(batches, null, 2));
+    console.log(`\n=== Processing Page ${page.pageId} ===`);
+    page.status = "in_progress";
+    await writeFile(pagesPath, JSON.stringify(pages, null, 2));
 
-    while (batch.currentUrl) {
-      const result = await fetchGraphApiWithRetry(batch.currentUrl, true);
+    while (page.currentUrl) {
+      const result = await fetchGraphApiWithRetry(page.currentUrl, true);
       if (!result) {
         console.error(
-          `Failed to fetch cursor for batch ${batch.id}. Halting batch progress.`,
+          `Failed to fetch cursor for page ${page.pageId}. Halting page progress.`,
         );
         break;
       }
 
       if (result.ids.length > 0) {
-        await appendIdsToGraphApiJson(graphApiPath, result.ids);
+        await appendIdsToGraphApiJsonl(graphApiPath, result.ids);
       }
 
       if (result.nextUrl) {
-        batch.currentUrl = result.nextUrl;
-        await writeFile(batchesPath, JSON.stringify(batches, null, 2));
+        page.currentUrl = result.nextUrl;
+        await writeFile(pagesPath, JSON.stringify(pages, null, 2));
       } else {
-        batch.currentUrl = null;
-        batch.status = "processed";
-        await writeFile(batchesPath, JSON.stringify(batches, null, 2));
-        console.log(`✓ Batch ${batch.id} exhausted completely.`);
+        page.currentUrl = null;
+        page.status = "processed";
+        await writeFile(pagesPath, JSON.stringify(pages, null, 2));
+        console.log(`✓ Page ${page.pageId} exhausted completely.`);
         break;
       }
     }
@@ -385,7 +367,18 @@ const processAdsFromGraphApi = async (
 ) => {
   let allIds: string[] = [];
   try {
-    allIds = JSON.parse(await readFile(graphApiPath, "utf8"));
+    const fileContent = await readFile(graphApiPath, "utf8");
+    allIds = fileContent
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line).id;
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
   } catch {
     console.error(
       `Could not read ${graphApiPath}. Have you run the collector step?`,
@@ -431,7 +424,7 @@ const processAdsFromGraphApi = async (
 
       currentIndex += slice.length;
       stdout.write(`\rProcessed ${currentIndex}/${allIds.length} ads`);
-      await setTimeoutP(1000 + Math.random() * 1000);
+      await setTimeoutP(1000 + Math.random() * 500);
     } catch (err) {
       if (err instanceof TemplateExpiredError) {
         console.log(
@@ -453,20 +446,20 @@ const processAdsFromGraphApi = async (
 
 const main = async () => {
   const CSV_FILE = "./page_ids.csv";
-  const BATCHES_JSON = "./batches.json";
-  const GRAPH_API_JSON = "./graph-api.json";
+  const PAGES_JSON = "./pages.json";
+  const GRAPH_API_JSONL = "./graph-api.jsonl";
   const ADS_JSONL = "./ads.jsonl";
 
-  // Step 1: Initialize batches tracking file
-  await initializeBatches(CSV_FILE, BATCHES_JSON);
+  // Step 1: Initialize pages tracking file
+  await initializePages(CSV_FILE, PAGES_JSON);
 
-  // Step 2: Traverse Graph API & harvest purely string IDs into graph-api.json
-  await collectAllAdIds(BATCHES_JSON, GRAPH_API_JSON);
+  // Step 2: Traverse Graph API & harvest purely string IDs into graph-api.jsonl
+  await collectAllAdIds(PAGES_JSON, GRAPH_API_JSONL);
 
   // Step 3 & 4: Process the harvested IDs using Puppeteer logic
   const browser = await launch({ headless: true });
   try {
-    await processAdsFromGraphApi(GRAPH_API_JSON, ADS_JSONL, browser);
+    await processAdsFromGraphApi(GRAPH_API_JSONL, ADS_JSONL, browser);
   } finally {
     await browser.close();
   }
