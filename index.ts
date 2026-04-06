@@ -6,7 +6,6 @@ import {
 } from "node:fs/promises";
 import assert from "node:assert";
 import process, { stdout } from "node:process";
-import { availableParallelism } from "node:os";
 import { setTimeout as setTimeoutP } from "node:timers/promises";
 
 import puppeteer from "puppeteer";
@@ -367,7 +366,7 @@ const processAdsFromGraphApi = async (
   graphApiPath: string,
   outputPath: string,
   browserSliceSize: number = 100,
-  networkSliceSize: number = availableParallelism(),
+  networkSliceSize: number = 20,
 ) => {
   let allIds: string[] = [];
   try {
