@@ -14,7 +14,7 @@ import { adLibraryResponseSchema } from "./validator.js";
 
 // --- Configuration & Constants ---
 const GRAPH_API_BASE_URL = "https://graph.facebook.com/v24.0/ads_archive";
-const SNAPSHOT_BASE_URL = "https://www.facebook.com/ads/archive/render_ad";
+const SNAPSHOT_BASE_URL = "https://www.facebook.com/ads/library";
 
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 assert.ok(ACCESS_TOKEN, "ACCESS_TOKEN must be set in environment variables");
@@ -43,7 +43,7 @@ interface GraphApiFetchResult {
 const extractLimit = (url: string): number => {
   const urlObj = new URL(url);
   const limit = urlObj.searchParams.get("limit");
-  return limit ? Number.parseInt(limit, 10) : 2000;
+  return limit ? Number.parseInt(limit, 10) : 4000;
 };
 
 const updateLimit = (url: string, newLimit: number): string => {
@@ -90,7 +90,7 @@ const initializePages = async (
       ad_active_status: "ALL",
       search_page_ids: pageId,
       ad_reached_countries: "['']",
-      limit: "2000",
+      limit: "4000",
       fields: "id",
       access_token: ACCESS_TOKEN,
     });
@@ -159,7 +159,7 @@ const fetchGraphApiWithRetry = async (
     }
 
     if (data.error) {
-      console.error("API Error:", data.error);
+      console.error("API Error:", JSON.stringify(data.error));
       if (data.error.code === 613) {
         throw new RateLimitError(data.error.message || "Global Rate Limit Reached");
       }
@@ -248,7 +248,6 @@ const captureGraphQLRequest = async (
   );
   const snapshotParams = new URLSearchParams({
     id: firstAdId,
-    access_token: ACCESS_TOKEN,
   });
 
   const snapshotUrl = `${SNAPSHOT_BASE_URL}?${snapshotParams.toString()}`;
@@ -344,7 +343,7 @@ const individualFetch = async (
     const responseData = await response.json();
     if (!responseData || responseData.errors) {
       throw new TemplateExpiredError(
-        `API error: ${responseData?.errors || "Unknown error"}`,
+        `API error: ${responseData?.errors ? JSON.stringify(responseData.errors) : "Unknown error"}`,
       );
     }
 
