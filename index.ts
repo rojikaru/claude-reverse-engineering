@@ -106,6 +106,13 @@ const initializePages = async (
   return pages;
 };
 
+class RateLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
 // --- Step 2: Graph API Collection ---
 
 const fetchGraphApiWithRetry = async (
@@ -153,6 +160,9 @@ const fetchGraphApiWithRetry = async (
 
     if (data.error) {
       console.error("API Error:", data.error);
+      if (data.error.code === 613) {
+        throw new RateLimitError(data.error.message || "Global Rate Limit Reached");
+      }
       return null;
     }
 
@@ -193,29 +203,37 @@ const collectAllAdIds = async (pagesPath: string, graphApiPath: string) => {
     page.status = "in_progress";
     await writeFile(pagesPath, JSON.stringify(pages, null, 2));
 
-    while (page.currentUrl) {
-      const result = await fetchGraphApiWithRetry(page.currentUrl, true);
-      if (!result) {
-        console.error(
-          `Failed to fetch cursor for page ${page.pageId}. Halting page progress.`,
-        );
-        break;
-      }
+    try {
+      while (page.currentUrl) {
+        const result = await fetchGraphApiWithRetry(page.currentUrl, true);
+        if (!result) {
+          console.error(
+            `Failed to fetch cursor for page ${page.pageId}. Halting page progress.`,
+          );
+          break;
+        }
 
-      if (result.ids.length > 0) {
-        await appendIdsToGraphApiJsonl(graphApiPath, result.ids);
-      }
+        if (result.ids.length > 0) {
+          await appendIdsToGraphApiJsonl(graphApiPath, result.ids);
+        }
 
-      if (result.nextUrl) {
-        page.currentUrl = result.nextUrl;
-        await writeFile(pagesPath, JSON.stringify(pages, null, 2));
-      } else {
-        page.currentUrl = null;
-        page.status = "processed";
-        await writeFile(pagesPath, JSON.stringify(pages, null, 2));
-        console.log(`✓ Page ${page.pageId} exhausted completely.`);
-        break;
+        if (result.nextUrl) {
+          page.currentUrl = result.nextUrl;
+          await writeFile(pagesPath, JSON.stringify(pages, null, 2));
+        } else {
+          page.currentUrl = null;
+          page.status = "processed";
+          await writeFile(pagesPath, JSON.stringify(pages, null, 2));
+          console.log(`✓ Page ${page.pageId} exhausted completely.`);
+          break;
+        }
       }
+    } catch (error) {
+      if (error instanceof RateLimitError) {
+        console.error(`\n🚨 Rate limit (613) reached on page ${page.pageId}. Halting all progress across all pages.`);
+        return; // Break completely out of collectAllAdIds 
+      }
+      throw error;
     }
   }
 };
