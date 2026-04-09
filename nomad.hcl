@@ -24,7 +24,7 @@ job "ads-library-test-scraper" {
             config {
                 command = var.runner_path
                 work_dir = var.app_dir
-                args = ["run", "index.ts"]
+                args = ["run", "client-api-2.ts"]
             }
 
             env = {

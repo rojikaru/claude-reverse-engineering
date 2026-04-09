@@ -10,6 +10,7 @@ import process, { stdout } from "node:process";
 import { setTimeout as setTimeoutP } from "node:timers/promises";
 
 import { type Browser, launch } from "puppeteer";
+
 import { adLibraryResponseSchema } from "./validator.js";
 
 // --- Configuration & Constants ---
@@ -52,9 +53,9 @@ const updateLimit = (url: string, newLimit: number): string => {
   return urlObj.toString();
 };
 
-const appendIdsToGraphApiJsonl = async (filePath: string, newIds: string[]) => {
+const appendIdsToGraphApiJsonl = async (filePath: string, newIds: string[], pageId: string) => {
   if (newIds.length === 0) return;
-  const content = newIds.map((id) => JSON.stringify({ id })).join("\n") + "\n";
+  const content = newIds.map((id) => JSON.stringify({ id, pageId })).join("\n") + "\n";
   await appendFile(filePath, content, "utf8");
 };
 
@@ -214,7 +215,7 @@ const collectAllAdIds = async (pagesPath: string, graphApiPath: string) => {
         }
 
         if (result.ids.length > 0) {
-          await appendIdsToGraphApiJsonl(graphApiPath, result.ids);
+          await appendIdsToGraphApiJsonl(graphApiPath, result.ids, page.pageId);
         }
 
         if (result.nextUrl) {
@@ -287,7 +288,7 @@ const captureGraphQLRequest = async (
         ),
       ),
     ]);
-    console.log(`✓ Intercepted GraphQL successfully.`);
+    console.log(`✓ Intercepted GraphQL successfully.`, JSON.stringify(capturedGraphQLRequest, null, 2));
   } catch (err) {
     console.error("Failed to capture GraphQL request:", err);
   } finally {
@@ -307,32 +308,28 @@ class TemplateExpiredError extends Error {
 // --- Step 4: Individual Fetching & Processing ---
 
 const individualFetch = async (
-  adID: string,
+  { id, pageId }: { id: string; pageId: string },
   writeStream: FileHandle,
   capturedGraphQLRequest: CapturedRequest,
 ) => {
-  const newVars = { adID };
-  const encodedNewVars = encodeURIComponent(JSON.stringify(newVars));
+  const newVars = {
+    adArchiveID: id,
+    pageID: pageId,
+    country: "ALL",
+  }
+  const capturedVars = JSON.parse(capturedGraphQLRequest.body.match(/variables=([^&]*)/)?.[1] || {}) || {};
+  const mergedVars = { ...capturedVars, ...newVars };
+  const encodedNewVars = encodeURIComponent(JSON.stringify(mergedVars));
 
   const modifiedBody = capturedGraphQLRequest.body.replace(
     /variables=[^&]*/,
     `variables=${encodedNewVars}`,
   );
 
-  const modifiedReferer = capturedGraphQLRequest.headers["referer"]?.replace(
-    /id=\d+/,
-    `id=${adID}`,
-  );
-
-  const modifiedHeaders = {
-    ...capturedGraphQLRequest.headers,
-    referer: modifiedReferer,
-  };
-
   try {
     const response = await fetch("https://www.facebook.com/api/graphql/", {
       method: "POST",
-      headers: modifiedHeaders,
+      headers: capturedGraphQLRequest.headers,
       body: modifiedBody,
     });
 
@@ -348,7 +345,7 @@ const individualFetch = async (
     }
 
     const data =
-      responseData.data?.ad_library_main?.demo_ad_archive_result
+      responseData.data?.ad_library_main?.ad_details
         ?.demo_ad_archive;
     if (!data) {
       throw new TemplateExpiredError("Missing expected data in response");
@@ -382,15 +379,15 @@ const processAdsFromGraphApi = async (
   browser: Browser,
   networkSliceSize: number = 20,
 ) => {
-  let allIds: string[] = [];
+  let allAds: { id: string; pageId: string }[] = [];
   try {
     const fileContent = await readFile(graphApiPath, "utf8");
-    allIds = fileContent
+    allAds = fileContent
       .split("\n")
       .filter(Boolean)
       .map((line) => {
         try {
-          return JSON.parse(line).id;
+          return JSON.parse(line);
         } catch {
           return null;
         }
@@ -403,44 +400,44 @@ const processAdsFromGraphApi = async (
     return;
   }
 
-  if (allIds.length === 0) {
+  if (allAds.length === 0) {
     console.log("No IDs to process.");
     return;
   }
 
   const writeStream = await fopen(outputPath, "a");
 
-  console.log(`\n=== Processing ${allIds.length} total ads ===`);
+  console.log(`\n=== Processing ${allAds.length} total ads ===`);
 
   let currentTemplate: CapturedRequest | null = null;
   let currentIndex = 0;
 
-  while (currentIndex < allIds.length) {
+  while (currentIndex < allAds.length) {
     if (!currentTemplate) {
       currentTemplate = await captureGraphQLRequest(
-        allIds[currentIndex],
+        allAds[currentIndex].id,
         browser,
       );
       if (!currentTemplate) {
         console.error(
-          `Failed to get GraphQL template for Ad ID ${allIds[currentIndex]}. Skipping one Ad ID.`,
+          `Failed to get GraphQL template for Ad ID ${allAds[currentIndex].id}. Skipping one Ad ID.`,
         );
         currentIndex++;
         continue;
       }
     }
 
-    const slice = allIds.slice(currentIndex, currentIndex + networkSliceSize);
+    const slice = allAds.slice(currentIndex, currentIndex + networkSliceSize);
 
     try {
       await Promise.all(
-        slice.map((adId) =>
-          individualFetch(adId, writeStream, currentTemplate!),
+        slice.map((ad) =>
+          individualFetch(ad, writeStream, currentTemplate!),
         ),
       );
 
       currentIndex += slice.length;
-      stdout.write(`\rProcessed ${currentIndex}/${allIds.length} ads`);
+      stdout.write(`\rProcessed ${currentIndex}/${allAds.length} ads`);
       await setTimeoutP(1000 + Math.random() * 500);
     } catch (err) {
       if (err instanceof TemplateExpiredError) {
